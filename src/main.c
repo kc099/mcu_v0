@@ -20,7 +20,6 @@
 #include "esp_flash.h"
 #include "nvs_flash.h"
 
-#include "esp_chip_info.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -51,10 +50,6 @@ static const int RX_READ_SIZE = 24;
 #define GPIO_OUTPUT_IO_1    21
 #define GPIO_OUTPUT_PIN_SEL  ((1ULL<<GPIO_OUTPUT_IO_0) | (1ULL<<GPIO_OUTPUT_IO_1))
 
-#define EXAMPLE_ESP_MAXIMUM_RETRY  10
-#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_OPEN
-
-
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
@@ -63,13 +58,16 @@ static EventGroupHandle_t s_wifi_event_group;
  * - we failed to connect after the maximum amount of retries */
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
+#define EXAMPLE_ESP_MAXIMUM_RETRY  10
+#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_OPEN
 
 static const char *TAG = "wifi station";
-
 static int s_retry_num = 0;
 
 
-
+/*
+* - Wifi event handler to connect amd retry wifi in station mode
+*/
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
@@ -92,6 +90,10 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
+
+/*
+* - Initializes WiFi driver and event group, tries to connect to ap and returns success/error
+*/
 void wifi_init_sta(void)
 {
     s_wifi_event_group = xEventGroupCreate();
@@ -121,11 +123,6 @@ void wifi_init_sta(void)
         .sta = {
             .ssid = "TP-Link_F237",
             .password = "42191544",
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (pasword len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-	     * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
             .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
         },
     };
@@ -154,13 +151,6 @@ void wifi_init_sta(void)
     }
 }
 
-static void log_error_if_nonzero(const char *message, int error_code)
-{
-    if (error_code != 0) {
-        ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
-    }
-}
-
 /*
  * @brief Event handler registered to receive MQTT events
  *
@@ -180,20 +170,13 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
-        msg_id = esp_mqtt_client_publish(client, "/topic/qos1", "data_3", 0, 1, 0);
-        ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
 
         msg_id = esp_mqtt_client_subscribe(client, "/topic/qos0", 0);
         ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
-
-        msg_id = esp_mqtt_client_subscribe(client, "/topic/qos1", 1);
-        ESP_LOGI(TAG, "sent subscribe successful, msg_id=%d", msg_id);
-
-        msg_id = esp_mqtt_client_unsubscribe(client, "/topic/qos1");
-        ESP_LOGI(TAG, "sent unsubscribe successful, msg_id=%d", msg_id);
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
+        mqtt_app_start();
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -211,16 +194,21 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
+        if(atoi(event->data)==1){
+            gpio_set_level(GPIO_OUTPUT_IO_0, 1);
+            gpio_set_level(GPIO_OUTPUT_IO_1, 1);
+        }
+        else if(atoi(event->data)==0){
+            gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+            gpio_set_level(GPIO_OUTPUT_IO_1, 0);
+
+        }
+        else{
+
+        }
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
-        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
-            log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
-            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
-            ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
-
-        }
         break;
     default:
         ESP_LOGI(TAG, "Other event id:%d", event->event_id);
@@ -231,18 +219,47 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 static void mqtt_app_start(void)
 {
     esp_mqtt_client_config_t mqtt_cfg = {
-     .uri = "mqtt://mqtt.eclipse.org",
-    
+     .host = "192.168.0.154",
+     .port = 1883,
     };
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    /* The last argument may be used to pass data to the event handler, in this example mqtt_event_handler */
+    /* The last argument may be used to pass data to the event handler, mqtt_event_handler */
     esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(client);
 }
 
+static int checksum(uint8_t* data){
+
+    uint8_t checksum = 0x00;
+
+    for (int i = 2; i <= 22; i++) {
+        checksum = checksum + data[i];
+    }   
+
+    if (checksum==data[23]) {
+        return 1;
+    }
+    else {
+        return 0;
+    }
+}
+
 void app_main(void)
 {
+    uint32_t VolPar;
+    uint32_t VolData=0; 
+    uint32_t CurrentPar;
+    uint32_t CurrentData=0; 
+    uint32_t PowerPar;
+    uint32_t PowerData=0;
+    uint16_t PF;
+    uint32_t PFOverflow=0;
+    uint32_t Voltage;
+    uint32_t Current;
+    uint32_t PowerFactor;
+    uint32_t kwh;
+    char* pVol = &Voltage;
 
     uart_config_t uart_config = {
     .baud_rate = 4800,
@@ -279,9 +296,7 @@ void app_main(void)
 
     printf("Minimum free heap size: %d bytes\n", esp_get_minimum_free_heap_size());
 
-    int cnt = 0;
-
-        //Initialize NVS
+    //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
@@ -290,20 +305,38 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+
     wifi_init_sta();
     mqtt_app_start();
+    gpio_set_level(GPIO_OUTPUT_IO_0, 1);
+    gpio_set_level(GPIO_OUTPUT_IO_1, 1);
 
     while (1) {
         const int rxBytes = uart_read_bytes(UART_NUM_2, data, RX_READ_SIZE, 50 / portTICK_PERIOD_MS);
         if (rxBytes == 24) {
-            data[rxBytes] = 0;
-            ESP_LOGI(RX_TASK_TAG, "Read %d bytes: '%s'", rxBytes, data);
-            ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, data, rxBytes, ESP_LOG_INFO);
+            if (data[1]==0x5a && checksum(data)){
+                VolPar = ((uint32_t)data[2] <<16) + ((uint32_t)data[3]<<8) + data[4];
+                if (0x40 & data[20]){
+                    VolData = ((uint32_t)data[5]<<16) + ((uint32_t)data[6]<<8) + data[7];
+                }
+                CurrentPar = ((uint32_t)data[8]<<16) + ((uint32_t)data[9]<<8) + data[10];
+                if (0x20 & data[20]){
+                    CurrentData = ((uint32_t)data[11]<<16) + ((uint32_t)data[12]<<8) + data[13];
+                }
+                PowerPar = ((uint32_t)data[14]<<16) + ((uint32_t)data[15]<<8) + data[16];
+                if (0x10 & data[20]){
+                    PowerData = ((uint32_t)data[17]<<16) + ((uint32_t)data[18]<<8) + data[19];
+                }
+                PF = ((uint32_t)data[21] <<8) + data[22];
+                if (0x80 & data[20]) {
+                    PFOverflow++;
+                }
+                Voltage = (VolPar * 1.88) / VolData;
+                Current = (CurrentPar * 1000) / CurrentData;
+                ESP_LOGI(RX_TASK_TAG, "Voltage: %zu, Current: '%zu'", Voltage, Current);
+                // ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, data, rxBytes, ESP_LOG_INFO);
+            }
         }
-        printf("cnt: %d\n", cnt++);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-        gpio_set_level(GPIO_OUTPUT_IO_0, cnt % 2);
-        gpio_set_level(GPIO_OUTPUT_IO_1, cnt % 2);
     }
     free(data);
 
